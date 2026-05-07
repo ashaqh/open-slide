@@ -292,6 +292,8 @@ function SortableThumb({
     if (activeRef) activeRef.current = node;
   };
 
+  const yOnlyTransform = transform ? { ...transform, x: 0 } : transform;
+
   return (
     <button
       ref={setRef}
@@ -300,7 +302,7 @@ function SortableThumb({
       aria-label={ariaLabel}
       aria-current={active ? 'true' : undefined}
       style={{
-        transform: CSS.Transform.toString(transform),
+        transform: CSS.Transform.toString(yOnlyTransform),
         transition,
         touchAction: 'none',
       }}
