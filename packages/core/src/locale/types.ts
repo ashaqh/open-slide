@@ -339,4 +339,15 @@ export type Locale = {
     prevAria: string;
     nextAria: string;
   };
+
+  notesDrawer: {
+    toggle: string;
+    /** template: "page {n}/{total}" */
+    pageLabel: string;
+    placeholder: string;
+    statusSaving: string;
+    statusSaved: string;
+    /** template: "Save failed: {msg}" */
+    statusError: string;
+  };
 };
