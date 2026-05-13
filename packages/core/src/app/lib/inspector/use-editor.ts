@@ -1,8 +1,16 @@
 import { useCallback } from 'react';
 
 export type EditOp =
-  | { kind: 'set-style'; key: string; value: string | null }
+  | { kind: 'set-style'; key: string; value: string | null; prevText?: string }
   | { kind: 'set-text'; value: string; prevText?: string }
+  | {
+      kind: 'set-text-range-style';
+      start: number;
+      end: number;
+      key: string;
+      value: string | null;
+      prevText?: string;
+    }
   | { kind: 'set-attr-asset'; attr: string; assetPath: string; previewUrl: string }
   | { kind: 'replace-placeholder-with-image'; assetPath: string };
 

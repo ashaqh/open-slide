@@ -188,8 +188,16 @@ function offsetToLine(source: string, offset: number): number {
 }
 
 export type EditOp =
-  | { kind: 'set-style'; key: string; value: string | null }
+  | { kind: 'set-style'; key: string; value: string | null; prevText?: string }
   | { kind: 'set-text'; value: string; prevText?: string }
+  | {
+      kind: 'set-text-range-style';
+      start: number;
+      end: number;
+      key: string;
+      value: string | null;
+      prevText?: string;
+    }
   | { kind: 'set-attr-asset'; attr: string; assetPath: string }
   | { kind: 'replace-placeholder-with-image'; assetPath: string };
 
@@ -201,11 +209,12 @@ type Splice = { from: number; to: number; text: string };
 
 function parseSource(source: string): t.File | null {
   try {
-    return babelParse(source, {
+    const ast = babelParse(source, {
       sourceType: 'module',
       plugins: ['typescript', 'jsx'],
       errorRecovery: true,
-    });
+    }) as t.File & { errors?: unknown[] };
+    return ast.errors && ast.errors.length > 0 ? null : ast;
   } catch {
     return null;
   }
@@ -224,6 +233,74 @@ function findInnermostJsxElement(ast: t.Node, line: number, column: number): t.J
     if (t.isJSXElement(n)) return n;
   }
   return null;
+}
+
+function findUniqueElementByText(ast: t.Node, prevText: string): t.JSXElement | null {
+  const hits: Array<{ node: t.JSXElement; size: number }> = [];
+  walkJsx(ast, (n) => {
+    if (!t.isJSXElement(n)) return;
+    const parts: TextRangePart[] = [];
+    collectTextRangeParts(n, parts);
+    if (textRangeContent(parts) !== prevText) return;
+    hits.push({ node: n, size: (n.end ?? 0) - (n.start ?? 0) });
+  });
+  if (hits.length === 0) return null;
+  hits.sort((a, b) => a.size - b.size);
+  const best = hits[0];
+  const bestStart = best.node.start ?? 0;
+  const bestEnd = best.node.end ?? 0;
+  const hasSiblingMatch = hits
+    .slice(1)
+    .some(({ node }) => (node.start ?? 0) > bestStart || (node.end ?? 0) < bestEnd);
+  return hasSiblingMatch ? null : best.node;
+}
+
+function fallbackTextForOps(ops: EditOp[]): string | null {
+  for (const op of ops) {
+    if (
+      (op.kind === 'set-style' || op.kind === 'set-text' || op.kind === 'set-text-range-style') &&
+      op.prevText !== undefined
+    ) {
+      return op.prevText;
+    }
+  }
+  return null;
+}
+
+function hasOnlyTextOps(ops: EditOp[]): boolean {
+  return ops.length > 0 && ops.every((op) => op.kind === 'set-text');
+}
+
+function elementTextMatches(element: t.JSXElement, prevText: string): boolean {
+  const parts: TextRangePart[] = [];
+  collectTextRangeParts(element, parts);
+  return textRangeContent(parts) === prevText;
+}
+
+function elementHasTextCandidate(ast: t.File, element: t.JSXElement, prevText: string): boolean {
+  const norm = prevText.trim();
+  return collectElementTextCandidates(ast, element).some((candidate) => candidate.current === norm);
+}
+
+function findElementForEdit(
+  ast: t.File,
+  line: number,
+  column: number,
+  ops: EditOp[],
+): t.JSXElement | null {
+  const element = findInnermostJsxElement(ast, line, column);
+  const prevText = fallbackTextForOps(ops);
+  if (prevText === null) return element;
+  if (
+    hasOnlyTextOps(ops) &&
+    element &&
+    (elementTextMatches(element, prevText) || elementHasTextCandidate(ast, element, prevText))
+  ) {
+    return element;
+  }
+  const textMatch = findUniqueElementByText(ast, prevText);
+  if (element && elementTextMatches(element, prevText)) return textMatch ?? element;
+  return textMatch ?? element;
 }
 
 function findJsxByStart(ast: t.Node, line: number, column: number): t.JSXElement | null {
@@ -261,9 +338,11 @@ function buildStyleSplice(
 ): Splice | { error: string } | null {
   const opening = element.openingElement;
   const existing = findJsxAttr(opening, 'style');
-  // Raw source slices, not parsed values — preserves variables and
-  // complex expressions exactly as authored.
-  const style = new Map<string, string>();
+  type StyleEntry =
+    | { kind: 'prop'; key: string; keyText: string; valueText: string }
+    | { kind: 'raw'; text: string };
+  const entries: StyleEntry[] = [];
+  let hasRawEntry = false;
 
   if (existing) {
     const value = existing.value;
@@ -272,46 +351,85 @@ function buildStyleSplice(
     }
     const expr = value.expression;
     if (!t.isObjectExpression(expr)) {
-      return { error: 'style is not a literal object' };
-    }
-    for (const prop of expr.properties) {
-      if (!t.isObjectProperty(prop)) {
-        return { error: 'style contains spread or method' };
-      }
-      if (prop.computed) return { error: 'style has computed key' };
-      let keyName: string | null = null;
-      if (t.isIdentifier(prop.key)) keyName = prop.key.name;
-      else if (t.isStringLiteral(prop.key)) keyName = prop.key.value;
-      if (!keyName) return { error: 'style has unsupported key' };
-      const v = prop.value;
-      if (typeof v.start !== 'number' || typeof v.end !== 'number') {
+      if (typeof expr.start !== 'number' || typeof expr.end !== 'number') {
         return { error: 'style value missing source range' };
       }
-      style.set(keyName, source.slice(v.start, v.end));
+      entries.push({ kind: 'raw', text: `...(${source.slice(expr.start, expr.end)})` });
+      hasRawEntry = true;
+    } else {
+      for (const prop of expr.properties) {
+        if (t.isObjectProperty(prop) && !prop.computed) {
+          let keyName: string | null = null;
+          if (t.isIdentifier(prop.key)) keyName = prop.key.name;
+          else if (t.isStringLiteral(prop.key)) keyName = prop.key.value;
+          if (!keyName) return { error: 'style has unsupported key' };
+          const v = prop.value;
+          if (
+            typeof prop.key.start !== 'number' ||
+            typeof prop.key.end !== 'number' ||
+            typeof v.start !== 'number' ||
+            typeof v.end !== 'number'
+          ) {
+            return { error: 'style value missing source range' };
+          }
+          entries.push({
+            kind: 'prop',
+            key: keyName,
+            keyText: source.slice(prop.key.start, prop.key.end),
+            valueText: source.slice(v.start, v.end),
+          });
+        } else {
+          if (typeof prop.start !== 'number' || typeof prop.end !== 'number') {
+            return { error: 'style value missing source range' };
+          }
+          entries.push({ kind: 'raw', text: source.slice(prop.start, prop.end) });
+          hasRawEntry = true;
+        }
+      }
     }
   }
 
   for (const op of ops) {
-    if (op.value === null) style.delete(op.key);
-    else style.set(op.key, jsString(op.value));
+    const matching = entries.filter((entry) => entry.kind === 'prop' && entry.key === op.key);
+    if (op.value === null) {
+      for (const entry of matching) entries.splice(entries.indexOf(entry), 1);
+      if (hasRawEntry) {
+        entries.push({ kind: 'prop', key: op.key, keyText: op.key, valueText: 'undefined' });
+      }
+    } else if (matching.length > 0) {
+      matching[matching.length - 1].valueText = jsString(op.value);
+    } else {
+      entries.push({ kind: 'prop', key: op.key, keyText: op.key, valueText: jsString(op.value) });
+    }
   }
 
-  if (style.size === 0) {
+  if (entries.length === 0) {
     if (!existing) return null;
     let from = existing.start ?? 0;
     if (from > 0 && source[from - 1] === ' ') from -= 1;
     return { from, to: existing.end ?? 0, text: '' };
   }
 
-  const propsText = Array.from(style.entries())
-    .map(([k, v]) => `${k}: ${v}`)
+  const propsText = entries
+    .map((entry) => (entry.kind === 'prop' ? `${entry.keyText}: ${entry.valueText}` : entry.text))
     .join(', ');
   const newAttr = `style={{ ${propsText} }}`;
 
   if (existing) {
+    const lastAttr = opening.attributes[opening.attributes.length - 1];
+    if (lastAttr && lastAttr !== existing && typeof lastAttr.end === 'number') {
+      const attrsAfterStyle = source.slice(existing.end ?? 0, lastAttr.end).replace(/^[ \t]+/, '');
+      return {
+        from: existing.start ?? 0,
+        to: lastAttr.end,
+        text: `${attrsAfterStyle} ${newAttr}`,
+      };
+    }
     return { from: existing.start ?? 0, to: existing.end ?? 0, text: newAttr };
   }
-  return { from: opening.name.end ?? 0, to: opening.name.end ?? 0, text: ` ${newAttr}` };
+  const lastAttr = opening.attributes[opening.attributes.length - 1];
+  const at = lastAttr?.end ?? opening.name.end ?? 0;
+  return { from: at, to: at, text: ` ${newAttr}` };
 }
 
 function formatJsxText(value: string): string {
@@ -332,12 +450,27 @@ type TextCandidate = {
 };
 
 type JsxParent = t.JSXElement | t.JSXFragment;
+type TextRangeLeaf = {
+  node: t.JSXText | t.JSXExpressionContainer;
+  parent: JsxParent;
+  current: string;
+  raw: string;
+  text: (value: string) => string;
+  offsets: Array<number | null>;
+};
+type TextRangeBreak = { node: t.JSXElement; current: '\n' };
+type TextRangePart = TextRangeLeaf | TextRangeBreak;
 
 function meaningfulChildren(parent: JsxParent): t.Node[] {
   return parent.children.filter((c) => {
     if (t.isJSXText(c)) return c.value.trim() !== '';
     return true;
   });
+}
+
+function isOnlyMeaningfulChild(parent: JsxParent, child: t.Node): boolean {
+  const meaningful = meaningfulChildren(parent);
+  return meaningful.length === 1 && meaningful[0] === child;
 }
 
 // Wrap-style splice: rewrite the whole children span of `parent`. Used
@@ -347,6 +480,64 @@ function wrapSplice(parent: JsxParent, text: string): Splice {
   const first = parent.children[0];
   const last = parent.children[parent.children.length - 1];
   return { from: first.start ?? 0, to: last.end ?? 0, text };
+}
+
+function splitLinesWithOffsets(value: string): Array<{ text: string; start: number }> {
+  const lines: Array<{ text: string; start: number }> = [];
+  let start = 0;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch !== '\n' && ch !== '\r') continue;
+    lines.push({ text: value.slice(start, i), start });
+    if (ch === '\r' && value[i + 1] === '\n') i += 1;
+    start = i + 1;
+  }
+  lines.push({ text: value.slice(start), start });
+  return lines;
+}
+
+function cleanJsxTextWithOffsets(value: string): {
+  text: string;
+  offsets: Array<number | null>;
+} {
+  const lines = splitLinesWithOffsets(value);
+  let lastNonEmptyLine = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].text.trim()) lastNonEmptyLine = i;
+  }
+
+  let text = '';
+  const offsets: Array<number | null> = [];
+  for (let i = 0; i < lines.length; i++) {
+    const chars = Array.from(lines[i].text, (ch, j) => ({
+      ch: ch === '\t' ? ' ' : ch,
+      offset: lines[i].start + j,
+    }));
+    let from = 0;
+    let to = chars.length;
+    if (i !== 0) {
+      while (from < to && chars[from].ch === ' ') from += 1;
+    }
+    if (i !== lines.length - 1) {
+      while (to > from && chars[to - 1].ch === ' ') to -= 1;
+    }
+    if (from >= to) continue;
+    for (const item of chars.slice(from, to)) {
+      text += item.ch;
+      offsets.push(item.offset);
+    }
+    if (i !== lastNonEmptyLine) {
+      text += ' ';
+      offsets.push(null);
+    }
+  }
+  return { text, offsets };
+}
+
+function isJsxBrElement(node: t.Node): node is t.JSXElement {
+  if (!t.isJSXElement(node)) return false;
+  const name = node.openingElement.name;
+  return t.isJSXIdentifier(name) && name.name.toLowerCase() === 'br';
 }
 
 function collectTextCandidates(element: JsxParent, out: TextCandidate[]): void {
@@ -379,6 +570,305 @@ function collectTextCandidates(element: JsxParent, out: TextCandidate[]): void {
       collectTextCandidates(child, out);
     }
   }
+}
+
+function collectTextRangeParts(element: JsxParent, out: TextRangePart[]): void {
+  const parts: TextRangePart[] = [];
+  collectTextRangePartsRaw(element, parts);
+  out.push(...normalizeTextRangeParts(parts));
+}
+
+function collectTextRangePartsRaw(element: JsxParent, out: TextRangePart[]): void {
+  for (const child of element.children) {
+    if (t.isJSXText(child)) {
+      const { text: current, offsets } = cleanJsxTextWithOffsets(child.value);
+      if (current) {
+        out.push({
+          node: child,
+          parent: element,
+          current,
+          raw: child.value,
+          text: formatJsxText,
+          offsets,
+        });
+      }
+    } else if (t.isJSXExpressionContainer(child)) {
+      const expression = child.expression;
+      if (t.isStringLiteral(expression) || t.isNumericLiteral(expression)) {
+        const raw = String(expression.value);
+        const current = raw;
+        if (current) {
+          out.push({
+            node: child,
+            parent: element,
+            current,
+            raw,
+            text: (value) => `{${jsString(value)}}`,
+            offsets: Array.from({ length: current.length }, (_, i) => i),
+          });
+        }
+      }
+    } else if (isJsxBrElement(child)) {
+      out.push({ node: child, current: '\n' });
+    } else if (t.isJSXElement(child) || t.isJSXFragment(child)) {
+      collectTextRangePartsRaw(child, out);
+    }
+  }
+}
+
+function normalizeTextRangeParts(parts: TextRangePart[]): TextRangePart[] {
+  return parts.flatMap((part, index) => {
+    if (!('raw' in part)) return [part];
+    let start = 0;
+    let end = part.current.length;
+    if (parts[index - 1]?.current === '\n') {
+      while (start < end && /\s/.test(part.current[start] ?? '')) start++;
+    }
+    if (parts[index + 1]?.current === '\n') {
+      while (end > start && /\s/.test(part.current[end - 1] ?? '')) end--;
+    }
+    if (start === 0 && end === part.current.length) return [part];
+    if (start >= end) return [];
+    return [
+      {
+        ...part,
+        current: part.current.slice(start, end),
+        offsets: part.offsets.slice(start, end),
+      },
+    ];
+  });
+}
+
+function resetValueForRangeStyle(key: string): string | null {
+  if (key === 'fontWeight') return '400';
+  if (key === 'fontStyle') return 'normal';
+  return null;
+}
+
+function styleSpanForText(text: string, key: string, value: string | null): string {
+  const styleValue = value ?? resetValueForRangeStyle(key);
+  if (styleValue === null) return formatJsxText(text);
+  return `<span style={{ ${key}: ${jsString(styleValue)} }}>${formatJsxText(text)}</span>`;
+}
+
+function textRangeContent(parts: TextRangePart[]): string {
+  return parts.map((part) => part.current).join('');
+}
+
+function compactText(value: string): string {
+  return value.replace(/\s+/g, '');
+}
+
+function textMatchesExpected(current: string, expected: string): boolean {
+  return current === expected || compactText(current) === compactText(expected);
+}
+
+function formatRichText(value: string, formatText = formatJsxText): string {
+  return value
+    .split('\n')
+    .map((part) => formatText(part))
+    .join('<br />');
+}
+
+function formatOptionalText(value: string, formatText = formatJsxText): string {
+  return value ? formatText(value) : '';
+}
+
+function textDiff(prevText: string, nextText: string) {
+  let start = 0;
+  while (
+    start < prevText.length &&
+    start < nextText.length &&
+    prevText[start] === nextText[start]
+  ) {
+    start += 1;
+  }
+
+  let prevEnd = prevText.length;
+  let nextEnd = nextText.length;
+  while (prevEnd > start && nextEnd > start && prevText[prevEnd - 1] === nextText[nextEnd - 1]) {
+    prevEnd -= 1;
+    nextEnd -= 1;
+  }
+
+  return { start, end: prevEnd, value: nextText.slice(start, nextEnd) };
+}
+
+function textLeafSplice(part: TextRangeLeaf, value: string): Splice {
+  const rawRange = textLeafRawRange(part, 0, part.current.length);
+  if (!rawRange) return spliceRange(part.node, part.text(value));
+  const { rawStart, rawEnd } = rawRange;
+  return {
+    from: part.node.start ?? 0,
+    to: part.node.end ?? 0,
+    text: `${part.raw.slice(0, rawStart)}${formatRichText(value, part.text)}${part.raw.slice(rawEnd)}`,
+  };
+}
+
+function textLeafRawRange(
+  part: TextRangeLeaf,
+  start: number,
+  end: number,
+): { rawStart: number; rawEnd: number } | null {
+  if (start >= end) return null;
+  let first: number | null = null;
+  let last: number | null = null;
+  for (let i = start; i < end; i++) {
+    const offset = part.offsets[i];
+    if (offset === undefined) return null;
+    if (offset === null) continue;
+    first ??= offset;
+    last = offset;
+  }
+  if (first === null || last === null) return null;
+  return { rawStart: first, rawEnd: last + 1 };
+}
+
+function buildTextRangeReplaceSplices(
+  parts: TextRangePart[],
+  start: number,
+  end: number,
+  value: string,
+): Splice[] | { error: string } {
+  const splices: Splice[] = [];
+  let offset = 0;
+  let inserted = false;
+
+  for (const part of parts) {
+    const partStart = offset;
+    const partEnd = partStart + part.current.length;
+    offset = partEnd;
+
+    const overlaps = start < partEnd && end > partStart;
+    const insertsHere = start === end && !inserted && start >= partStart && start <= partEnd;
+    if (!overlaps && !insertsHere) continue;
+
+    if ('raw' in part) {
+      const localStart = Math.max(start, partStart) - partStart;
+      const localEnd = overlaps ? Math.min(end, partEnd) - partStart : localStart;
+      const nextText = `${part.current.slice(0, localStart)}${inserted ? '' : value}${part.current.slice(localEnd)}`;
+      splices.push(textLeafSplice(part, nextText));
+    } else if (overlaps) {
+      splices.push(spliceRange(part.node, inserted ? '' : formatRichText(value)));
+    } else if (insertsHere) {
+      const at = start === partStart ? (part.node.start ?? 0) : (part.node.end ?? 0);
+      splices.push({ from: at, to: at, text: formatRichText(value) });
+    }
+
+    inserted = true;
+  }
+
+  if (!inserted && start === end && start === offset) {
+    const last = parts[parts.length - 1];
+    if (!last) return { error: 'element has no editable text' };
+    if ('raw' in last) {
+      splices.push(textLeafSplice(last, `${last.current}${value}`));
+    } else {
+      splices.push({
+        from: last.node.end ?? 0,
+        to: last.node.end ?? 0,
+        text: formatRichText(value),
+      });
+    }
+  }
+
+  return splices;
+}
+
+function buildTextContentSplices(
+  element: t.JSXElement,
+  value: string,
+  prevText: string,
+): Splice[] | { error: string } {
+  const parts: TextRangePart[] = [];
+  collectTextRangeParts(element, parts);
+  const current = textRangeContent(parts);
+  if (!textMatchesExpected(current, prevText)) {
+    return { error: 'no text candidate matches the current value' };
+  }
+  const diff = textDiff(current, value);
+  if (diff.start === diff.end && diff.value === '') return [];
+  return buildTextRangeReplaceSplices(parts, diff.start, diff.end, diff.value);
+}
+
+function buildTextRangeStyleSplices(
+  ast: t.File,
+  source: string,
+  element: t.JSXElement,
+  start: number,
+  end: number,
+  op: { key: string; value: string | null },
+  prevText?: string,
+): Splice[] | { error: string } | null {
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) {
+    return { error: 'invalid text range' };
+  }
+
+  const parts: TextRangePart[] = [];
+  collectTextRangeParts(element, parts);
+  const current = prevText ?? textRangeContent(parts);
+  if (!current) return { error: 'element has no editable text' };
+  if (end > current.length) return { error: 'text range is out of bounds' };
+  const renderedText = textRangeContent(parts);
+  if (prevText !== undefined && renderedText !== prevText) {
+    if (elementTextCandidateMatches(ast, element, prevText)) {
+      const result = buildStyleSplice(source, element, [op]);
+      if (result && 'error' in result) return result;
+      return result ? [result] : [];
+    }
+    return { error: 'no text candidate matches the current value' };
+  }
+
+  const splices: Splice[] = [];
+  let leafStart = 0;
+  for (const leaf of parts) {
+    const leafEnd = leafStart + leaf.current.length;
+    if (!('raw' in leaf)) {
+      leafStart = leafEnd;
+      continue;
+    }
+    const selectedStart = Math.max(start, leafStart);
+    const selectedEnd = Math.min(end, leafEnd);
+    if (selectedStart >= selectedEnd) {
+      leafStart = leafEnd;
+      continue;
+    }
+
+    if (
+      selectedStart === leafStart &&
+      selectedEnd === leafEnd &&
+      t.isJSXElement(leaf.parent) &&
+      leaf.parent !== element &&
+      isOnlyMeaningfulChild(leaf.parent, leaf.node)
+    ) {
+      const result = buildStyleSplice(source, leaf.parent, [op]);
+      if (result && 'error' in result) return result;
+      if (result) splices.push(result);
+      leafStart = leafEnd;
+      continue;
+    }
+
+    const localStart = selectedStart - leafStart;
+    const localEnd = selectedEnd - leafStart;
+    const rawRange = textLeafRawRange(leaf, localStart, localEnd);
+    if (!rawRange) return { error: 'text range source mismatch' };
+    const raw = leaf.raw;
+    const { rawStart, rawEnd } = rawRange;
+    const before = raw.slice(0, rawStart);
+    const selected = leaf.current.slice(localStart, localEnd);
+    const after = raw.slice(rawEnd);
+    const beforeText = t.isJSXText(leaf.node) ? before : formatOptionalText(before, leaf.text);
+    const afterText = t.isJSXText(leaf.node) ? after : formatOptionalText(after, leaf.text);
+    splices.push(
+      spliceRange(
+        leaf.node,
+        `${beforeText}${styleSpanForText(selected, op.key, op.value)}${afterText}`,
+      ),
+    );
+    leafStart = leafEnd;
+  }
+
+  return splices.length > 0 ? splices : null;
 }
 
 // `<Wrap>{children}</Wrap>` and `<h2>{title}</h2>` — sole child is a
@@ -632,12 +1122,7 @@ function collectArrayMapCandidates(ast: t.Node, element: t.JSXElement): TextCand
   return out;
 }
 
-function buildTextSplice(
-  ast: t.File,
-  element: t.JSXElement,
-  value: string,
-  prevText?: string,
-): Splice | { error: string } {
+function collectElementTextCandidates(ast: t.File, element: t.JSXElement): TextCandidate[] {
   const candidates: TextCandidate[] = [];
   collectTextCandidates(element, candidates);
   if (candidates.length === 0) {
@@ -645,22 +1130,32 @@ function buildTextSplice(
     const enclosing = passthrough ? findEnclosingComponent(ast, element) : null;
     if (passthrough === 'children' && enclosing) {
       candidates.push(...collectCallSiteCandidates(ast, enclosing.name));
-    } else if (
-      // `<h2>{title}</h2>` — route to the matching prop literal at each
-      // call site so reused components are independently editable.
-      passthrough &&
-      enclosing &&
-      componentDestructuresProp(enclosing.fn, passthrough)
-    ) {
+    } else if (passthrough && enclosing && componentDestructuresProp(enclosing.fn, passthrough)) {
       candidates.push(...collectPropCallSiteCandidates(ast, enclosing.name, passthrough));
     }
   }
   if (candidates.length === 0) {
-    // `surfaces.map((s) => <div>{s.label}</div>)` and the destructured
-    // form `({ label }) => <div>{label}</div>` — text lives in the
-    // matching object literal of the iterated array.
     candidates.push(...collectArrayMapCandidates(ast, element));
   }
+  return candidates;
+}
+
+function elementTextCandidateMatches(
+  ast: t.File,
+  element: t.JSXElement,
+  prevText: string,
+): boolean {
+  const norm = prevText.trim();
+  return collectElementTextCandidates(ast, element).some((candidate) => candidate.current === norm);
+}
+
+function buildTextSplice(
+  ast: t.File,
+  element: t.JSXElement,
+  value: string,
+  prevText?: string,
+): Splice | { error: string } {
+  const candidates = collectElementTextCandidates(ast, element);
   if (candidates.length === 0) {
     return { error: 'element has no editable text' };
   }
@@ -847,7 +1342,7 @@ export function applyEdit(
 
   const ast = parseSource(source);
   if (!ast) return { ok: false, status: 422, error: 'could not parse source' };
-  const element = findInnermostJsxElement(ast, line, column);
+  const element = findElementForEdit(ast, line, column, ops);
   if (!element) return { ok: false, status: 422, error: 'no JSX element at location' };
 
   const splices: Splice[] = [];
@@ -864,10 +1359,38 @@ export function applyEdit(
   }
 
   for (const op of ops) {
+    if (op.kind !== 'set-text-range-style') continue;
+    const result = buildTextRangeStyleSplices(
+      ast,
+      source,
+      element,
+      op.start,
+      op.end,
+      { key: op.key, value: op.value },
+      op.prevText,
+    );
+    if (result && 'error' in result) return { ok: false, status: 422, error: result.error };
+    if (result) splices.push(...result);
+  }
+
+  for (const op of ops) {
     if (op.kind !== 'set-text') continue;
+    if (op.prevText !== undefined && (op.value.includes('\n') || op.prevText.includes('\n'))) {
+      const richResult = buildTextContentSplices(element, op.value, op.prevText);
+      if (!('error' in richResult)) {
+        splices.push(...richResult);
+        continue;
+      }
+    }
     const result = buildTextSplice(ast, element, op.value, op.prevText);
-    if ('error' in result) return { ok: false, status: 422, error: result.error };
-    splices.push(result);
+    if ('error' in result) {
+      if (op.prevText === undefined) return { ok: false, status: 422, error: result.error };
+      const richResult = buildTextContentSplices(element, op.value, op.prevText);
+      if ('error' in richResult) return { ok: false, status: 422, error: result.error };
+      splices.push(...richResult);
+    } else {
+      splices.push(result);
+    }
   }
 
   const assetOps = ops.flatMap((op) => (op.kind === 'set-attr-asset' ? [op] : []));
@@ -906,6 +1429,9 @@ export function applyEdit(
   let next = source;
   for (const sp of splices) {
     next = next.slice(0, sp.from) + sp.text + next.slice(sp.to);
+  }
+  if (!parseSource(next)) {
+    return { ok: false, status: 422, error: 'edit would produce invalid source' };
   }
   return { ok: true, source: next };
 }

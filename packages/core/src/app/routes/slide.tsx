@@ -39,38 +39,20 @@ import { type ThumbnailActions, ThumbnailRail } from '../components/thumbnail-ra
 import { exportSlideAsHtml } from '../lib/export-html';
 import { exportSlideAsPdf } from '../lib/export-pdf';
 import { remapNotesSessionCacheAfterReorder } from '../lib/inspector/use-notes';
-import type { SlideModule } from '../lib/sdk';
-import { loadSlide } from '../lib/slides';
+import { useSlideModule } from '../lib/use-slide-module';
 
 const { showSlideUi, showSlideBrowser, allowHtmlDownload } = config.build;
 
 export function Slide() {
   const { slideId = '' } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [slide, setSlide] = useState<SlideModule | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { slide, error } = useSlideModule(slideId);
   const [playing, setPlaying] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [designOpen, setDesignOpen] = useState(false);
   const { renameSlide } = useFolders();
   const slideViewportRef = useRef<HTMLElement>(null);
   const t = useLocale();
-
-  useEffect(() => {
-    let cancelled = false;
-    setSlide(null);
-    setError(null);
-    loadSlide(slideId)
-      .then((mod) => {
-        if (!cancelled) setSlide(mod);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(String(e?.message ?? e));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [slideId]);
 
   const modulePages = useMemo(() => slide?.default ?? [], [slide]);
   const [pages, setPages] = useState<typeof modulePages>(modulePages);
